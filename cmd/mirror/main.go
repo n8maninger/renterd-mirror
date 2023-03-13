@@ -227,13 +227,16 @@ func main() {
 				renterdPath := filepath.Join(*bucket, *obj.Key)
 				start := time.Now()
 				log.Printf("worker %d: starting upload of %s %s (object %d - %s)", worker, renterdPath, formatByteString(uint64(obj.Size)), atomic.LoadUint64(&uploadedObjects), formatByteString(atomic.LoadUint64(&uploadedBytes)))
-				for j := 0; j < 5; j++ { // retry failed uploads
+				for j := 0; j < 10; j++ { // retry failed uploads
 					if uploadErr = uploadObject(client, *bucket, *obj.Key, renterdPath); uploadErr != nil {
 						log.Printf("worker %d: upload attempt %v failed: %v", worker, j+1, uploadErr)
 						time.Sleep(30 * time.Second)
 					} else {
 						break
 					}
+				}
+				if uploadErr != nil {
+					log.Fatalf("worker %d: upload of %s failed: %v", worker, renterdPath, uploadErr)
 				}
 				elapsed := time.Since(start)
 				redundantSize, err := objectSize(bus, renterdPath)
