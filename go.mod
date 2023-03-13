@@ -1,4 +1,4 @@
-module github.com/siafoundation/dataset-mirror
+module github.com/n8maninger/renterd-mirror
 
 go 1.19
 
