@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -118,17 +119,8 @@ func uploadObject(client *s3.Client, bucket, key, renterdPath string) error {
 	return nil
 }
 
-func objectSize(bus *bus.Client, path string) (uint64, error) {
-	object, _, err := bus.Object(context.Background(), strings.TrimLeft(path, "/"))
-	if err != nil {
-		return 0, fmt.Errorf("failed to get object %s: %w", path, err)
-	}
-
-	var sectors uint64
-	for _, slab := range object.Slabs {
-		sectors += uint64(len(slab.Shards))
-	}
-	return sectors * rhp.SectorSize, nil
+func redundantSize(size uint64, minShards, totalShards int) uint64 {
+	return uint64(math.Ceil(float64(size)/float64(uint64(minShards)*rhp.SectorSize))) * uint64(totalShards) * rhp.SectorSize
 }
 
 func updateHostAllowlist() error {
@@ -156,7 +148,7 @@ func updateHostAllowlist() error {
 	filter.WithBenchmarked(true)
 	filter.WithMinAge(4320)
 	filter.WithMinUptime(0.7)
-	filter.WithMinUploadSpeed(5e6)
+	filter.WithMinUploadSpeed(2.5e7)
 	filter.WithMaxContractPrice(stypes.SiacoinPrecision.Div64(2))
 	filter.WithMaxUploadPrice(stypes.SiacoinPrecision.Mul64(100).Div64(1e12))
 	filter.WithMaxDownloadPrice(stypes.SiacoinPrecision.Mul64(5000).Div64(1e12))
@@ -219,7 +211,7 @@ func main() {
 
 	uploadQueue := make(chan awstypes.Object, threads)
 
-	var uploadedBytes, uploadedObjects uint64
+	var uploadedBytes, redundantBytes, uploadedObjects uint64
 	for i := 0; i < threads; i++ {
 		go func(worker int) {
 			for obj := range uploadQueue {
@@ -239,13 +231,11 @@ func main() {
 					log.Fatalf("worker %d: upload of %s failed: %v", worker, renterdPath, uploadErr)
 				}
 				elapsed := time.Since(start)
-				redundantSize, err := objectSize(bus, renterdPath)
-				if err != nil {
-					log.Fatalln(err)
-				}
+				redundantSize := redundantSize(uint64(obj.Size), minShards, totalShards)
 				u := atomic.AddUint64(&uploadedBytes, uint64(obj.Size))
 				n := atomic.AddUint64(&uploadedObjects, 1)
-				log.Printf("finished upload of %s %s in %s (%s including redundandancy - %s) (object %d - %s)", renterdPath, formatByteString(uint64(obj.Size)), elapsed, formatByteString(redundantSize), formatBpsString(redundantSize, elapsed), n, formatByteString(u))
+				ru := atomic.AddUint64(&redundantBytes, redundantSize)
+				log.Printf("finished upload of %s %s in %s (%s including redundandancy - %s) (object %d - %s - %s including redundancy)", renterdPath, formatByteString(uint64(obj.Size)), elapsed, formatByteString(redundantSize), formatBpsString(redundantSize, elapsed), n, formatByteString(u), formatByteString(ru))
 			}
 		}(i)
 	}
@@ -264,9 +254,11 @@ func main() {
 			if err != nil {
 				log.Fatalln(err)
 			} else if exists {
+				redundantSize := redundantSize(uint64(obj.Size), minShards, totalShards)
 				uploaded := atomic.AddUint64(&uploadedBytes, uint64(obj.Size))
+				ru := atomic.AddUint64(&redundantBytes, redundantSize)
 				n := atomic.AddUint64(&uploadedObjects, 1)
-				log.Printf("skipping existing object: %v (%d - %s)", renterdPath, n, formatByteString(uploaded))
+				log.Printf("skipping existing object: %v (%d - %s - %s included redundancy)", renterdPath, n, formatByteString(uploaded), formatByteString(ru))
 				continue
 			}
 			uploadQueue <- obj
