@@ -23,6 +23,8 @@ import (
 	stypes "go.sia.tech/siad/types"
 )
 
+const sectors = 5 * (1 << 40) / rhp.SectorSize
+
 var (
 	bucketName string
 	awsRegion  string
@@ -147,7 +149,6 @@ func updateHostAllowlist() error {
 	filter.WithAcceptingContracts(true)
 	filter.WithBenchmarked(true)
 	filter.WithMinAge(4320)
-	filter.WithMinUptime(0.7)
 	filter.WithMinUploadSpeed(2.5e7)
 	filter.WithMaxContractPrice(stypes.SiacoinPrecision.Div64(2))
 	filter.WithMaxUploadPrice(stypes.SiacoinPrecision.Mul64(100).Div64(1e12))
