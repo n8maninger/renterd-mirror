@@ -149,17 +149,16 @@ func updateHostAllowlist() error {
 	filter.WithAcceptingContracts(true)
 	filter.WithBenchmarked(true)
 	filter.WithMinAge(4320)
-	filter.WithMinUploadSpeed(2.5e7)
+	filter.WithMinUploadSpeed(2e7)
 	filter.WithMaxContractPrice(stypes.SiacoinPrecision.Div64(2))
-	filter.WithMaxUploadPrice(stypes.SiacoinPrecision.Mul64(100).Div64(1e12))
+	filter.WithMaxUploadPrice(stypes.SiacoinPrecision.Mul64(1000).Div64(1e12))
 	filter.WithMaxDownloadPrice(stypes.SiacoinPrecision.Mul64(5000).Div64(1e12))
 
 	for i := 0; ; i++ {
 		hosts, err := sc.GetActiveHosts(filter, i, 500)
 		if err != nil {
 			return fmt.Errorf("failed to get hosts: %w", err)
-		}
-		if len(hosts) == 0 {
+		} else if len(hosts) == 0 {
 			break
 		}
 		for _, host := range hosts {
