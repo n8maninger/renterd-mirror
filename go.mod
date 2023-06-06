@@ -10,6 +10,8 @@ require (
 	go.sia.tech/core v0.1.9
 	go.sia.tech/renterd v0.0.0-20230304133932-51bcc5c037b7
 	go.sia.tech/siad v1.5.10-0.20221206172719-7f3713a01004
+	go.uber.org/zap v1.24.0
+	golang.org/x/time v0.3.0
 )
 
 require (
@@ -65,7 +67,6 @@ require (
 	go.sia.tech/mux v1.2.0 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
-	go.uber.org/zap v1.24.0 // indirect
 	golang.org/x/crypto v0.5.0 // indirect
 	golang.org/x/net v0.7.0 // indirect
 	golang.org/x/sys v0.5.0 // indirect
