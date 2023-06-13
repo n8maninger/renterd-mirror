@@ -137,42 +137,26 @@ func updateHostAllowlist() (good int, bad int, _ error) {
 	}
 
 	var goodHosts, badHosts []types.PublicKey
-	// get good hosts
-	filter := make(sia.HostFilter)
-	filter.WithAcceptingContracts(true)
-	filter.WithBenchmarked(true)
-	filter.WithMinAge(4320)
-	filter.WithMinUploadSpeed(2e7)
-	filter.WithMaxContractPrice(stypes.SiacoinPrecision.Div64(2))
-	filter.WithMaxUploadPrice(stypes.SiacoinPrecision.Mul64(1000).Div64(1e12))
-	filter.WithMaxDownloadPrice(stypes.SiacoinPrecision.Mul64(5000).Div64(1e12))
-
-	var hostPub types.PublicKey
-	if err := hostPub.UnmarshalText([]byte("ed25519:b8c2d68bf993ec48908f120b8bd7fff03dd1c055b6920002d157261d82367431")); err != nil {
-		return 0, 0, fmt.Errorf("failed to unmarshal public key: %w", err)
-	} else if !currentHosts[hostPub] {
-		goodHosts = append(goodHosts, hostPub)
+	// get the top 150 fastest hosts
+	hosts, err := sc.GetActiveHosts(0, 150,
+		sia.HostFilterAcceptingContracts(true),
+		sia.HostFilterBenchmarked(true),
+		sia.HostFilterMaxContractPrice(stypes.SiacoinPrecision.Div64(2)),
+		sia.HostFilterSort(sia.HostSortUploadSpeed, true))
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get hosts: %w", err)
 	}
-	delete(currentHosts, hostPub)
 
-	for i := 0; ; i++ {
-		hosts, err := sc.GetActiveHosts(filter, i, 500)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to get hosts: %w", err)
-		} else if len(hosts) == 0 {
-			break
+	for _, host := range hosts {
+		var pub types.PublicKey
+		if err := pub.UnmarshalText([]byte(host.PublicKey)); err != nil {
+			return 0, 0, fmt.Errorf("failed to unmarshal public key: %w", err)
 		}
-		for _, host := range hosts {
-			var pub types.PublicKey
-			if err := pub.UnmarshalText([]byte(host.PublicKey)); err != nil {
-				return 0, 0, fmt.Errorf("failed to unmarshal public key: %w", err)
-			}
-			if currentHosts[pub] {
-				delete(currentHosts, pub)
-				continue
-			}
-			goodHosts = append(goodHosts, pub)
+		if currentHosts[pub] {
+			delete(currentHosts, pub)
+			continue
 		}
+		goodHosts = append(goodHosts, pub)
 	}
 
 	for pub := range currentHosts {
@@ -221,12 +205,12 @@ func main() {
 	log.Info("starting mirror")
 	uploadQueue := make(chan awstypes.Object, threads)
 	var uploadedBytes, redundantBytes, totalBytes, uploadedObjects uint64
-	var totalElapsed int64
+	uploadStart := time.Now()
 
 	s := rate.Sometimes{Interval: time.Minute}
 	logProgress := func() {
 		s.Do(func() {
-			elapsed := time.Duration(atomic.LoadInt64((*int64)(&totalElapsed)))
+			elapsed := time.Since(uploadStart)
 			uploadedBytes := atomic.LoadUint64(&redundantBytes)
 			totalBytes := atomic.LoadUint64(&totalBytes)
 			n := atomic.LoadUint64(&uploadedObjects)
@@ -261,7 +245,6 @@ func main() {
 				// calculate the redundant size of the object
 				redundantSize := redundantSize(uint64(obj.Size), minShards, totalShards)
 				// increment the global counters
-				atomic.AddInt64(&totalElapsed, int64(elapsed))
 				atomic.AddUint64(&uploadedBytes, uint64(obj.Size))
 				atomic.AddUint64(&uploadedObjects, 1)
 				atomic.AddUint64(&totalBytes, redundantSize)

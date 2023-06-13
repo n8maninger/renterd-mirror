@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.17.4
 	github.com/aws/aws-sdk-go-v2/config v1.18.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.30.2
-	github.com/siacentral/apisdkgo v0.2.7
+	github.com/siacentral/apisdkgo v0.2.8-0.20230516191524-1111b05ff2fa
 	go.sia.tech/core v0.1.9
 	go.sia.tech/renterd v0.0.0-20230304133932-51bcc5c037b7
 	go.sia.tech/siad v1.5.10-0.20221206172719-7f3713a01004
