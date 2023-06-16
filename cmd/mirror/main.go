@@ -18,11 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/siacentral/apisdkgo/sia"
 	"go.sia.tech/core/rhp/v2"
-	"go.sia.tech/core/types"
 	"go.sia.tech/renterd/bus"
-	stypes "go.sia.tech/siad/types"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/time/rate"
@@ -118,59 +115,6 @@ func redundantSize(size uint64, minShards, totalShards int) uint64 {
 	return uint64(math.Ceil(float64(size)/float64(uint64(minShards)*rhp.SectorSize))) * uint64(totalShards) * rhp.SectorSize
 }
 
-func updateHostAllowlist() (good int, bad int, _ error) {
-	sc := sia.NewClient()
-	b := bus.NewClient(busAddr, busPass)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	// get current host allowlist
-	allowlist, err := b.HostAllowlist(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get host allowlist: %w", err)
-	}
-
-	currentHosts := make(map[types.PublicKey]bool)
-	for _, host := range allowlist {
-		currentHosts[host] = true
-	}
-
-	var goodHosts, badHosts []types.PublicKey
-	// get the top 150 fastest hosts
-	hosts, err := sc.GetActiveHosts(0, 150,
-		sia.HostFilterAcceptingContracts(true),
-		sia.HostFilterBenchmarked(true),
-		sia.HostFilterMaxContractPrice(stypes.SiacoinPrecision.Div64(2)),
-		sia.HostFilterSort(sia.HostSortUploadSpeed, true))
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get hosts: %w", err)
-	}
-
-	for _, host := range hosts {
-		var pub types.PublicKey
-		if err := pub.UnmarshalText([]byte(host.PublicKey)); err != nil {
-			return 0, 0, fmt.Errorf("failed to unmarshal public key: %w", err)
-		}
-		if currentHosts[pub] {
-			delete(currentHosts, pub)
-			continue
-		}
-		goodHosts = append(goodHosts, pub)
-	}
-
-	for pub := range currentHosts {
-		badHosts = append(badHosts, pub)
-	}
-
-	if len(goodHosts) == 0 && len(badHosts) == 0 {
-		return 0, 0, nil
-	} else if err := b.UpdateHostAllowlist(ctx, goodHosts, badHosts); err != nil {
-		return 0, 0, fmt.Errorf("failed to update host allowlist: %w", err)
-	}
-	return len(goodHosts), len(badHosts), nil
-}
-
 func main() {
 	logCfg := zap.NewProductionConfig()
 	logCfg.OutputPaths = []string{logPath, "stdout"}
@@ -188,19 +132,6 @@ func main() {
 
 	client := s3.NewFromConfig(cfg)
 	bucket := aws.String(bucketName)
-
-	go func() {
-		log := log.Named("hosts")
-		// update host allowlist every 10 minutes
-		t := time.NewTicker(10 * time.Minute)
-		for range t.C {
-			good, bad, err := updateHostAllowlist()
-			if err != nil {
-				log.Warn("failed to update host allowlist", zap.Error(err))
-			}
-			log.Info("updated host allowlist", zap.Int("added", good), zap.Int("removed", bad))
-		}
-	}()
 
 	log.Info("starting mirror")
 	uploadQueue := make(chan awstypes.Object, threads)
