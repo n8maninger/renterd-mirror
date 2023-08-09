@@ -3,7 +3,6 @@ module github.com/n8maninger/renterd-mirror
 go 1.19
 
 require (
-	github.com/aws/aws-sdk-go v1.44.287
 	github.com/aws/aws-sdk-go-v2 v1.17.4
 	github.com/aws/aws-sdk-go-v2/config v1.18.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.30.2
@@ -39,7 +38,6 @@ require (
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/gotd/contrib v0.15.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0 // indirect
-	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.3 // indirect
 	github.com/klauspost/reedsolomon v1.11.7 // indirect

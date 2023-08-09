@@ -142,7 +142,7 @@ func main() {
 		log.Fatal("failed to load AWS config", zap.Error(err))
 	}
 
-	client := s3.NewFromConfig(cfg)
+	s3Client = s3.NewFromConfig(cfg)
 	bucket := aws.String(bucketName)
 
 	log.Info("starting mirror")
@@ -198,7 +198,7 @@ func main() {
 		}(log)
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+	paginator := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
 		Bucket: bucket,
 	})
 	log = log.Named("aws").With(zap.String("bucket", *bucket))
