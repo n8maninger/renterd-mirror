@@ -18,8 +18,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"go.sia.tech/core/rhp/v2"
+	rhp2 "go.sia.tech/core/rhp/v2"
+	"go.sia.tech/renterd/api"
 	"go.sia.tech/renterd/bus"
+	"go.sia.tech/renterd/worker"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/time/rate"
@@ -36,7 +38,13 @@ var (
 	minShards, totalShards int
 	contractSet            string
 
+	verifyUploads bool
+
 	threads int
+
+	workerClient *worker.Client
+	busClient    *bus.Client
+	s3Client     *s3.Client
 )
 
 func formatBpsString(b uint64, t time.Duration) string {
@@ -73,29 +81,32 @@ func init() {
 	flag.IntVar(&minShards, "worker.minshards", 10, "minimum shards per file")
 	flag.IntVar(&totalShards, "worker.totalshards", 30, "total shards per file")
 	flag.IntVar(&threads, "threads", 2, "number of threads to use")
+	flag.BoolVar(&verifyUploads, "verify", false, "periodically verify uploaded data")
 
 	flag.StringVar(&busAddr, "bus.address", "http://localhost:9980/api/bus", "bus address")
 	flag.StringVar(&busPass, "bus.password", "password", "bus password")
 	flag.Parse()
 }
 
-func objectExists(bus *bus.Client, renterdPath string) (bool, error) {
+func objectExists(renterdPath string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	_, _, err := bus.Object(ctx, renterdPath)
+	obj, _, err := busClient.Object(ctx, renterdPath, api.ObjectsWithLimit(1), api.ObjectsWithOffset(0))
 	if err == nil {
 		return true, nil
 	} else if strings.Contains(err.Error(), "object not found") {
 		return false, nil
 	} else if strings.Contains(err.Error(), "no slabs found") {
 		return false, nil
+	} else if obj.Health <= 25 {
+		return false, nil
 	}
 	return false, err
 }
 
-func uploadObject(client *s3.Client, bucket, key, renterdPath string) ([32]byte, error) {
-	content, err := client.GetObject(context.Background(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+func uploadObject(bucket, key, renterdPath string) ([32]byte, error) {
+	content, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("failed to get object %s/%s: %w", bucket, key, err)
 	}
@@ -103,7 +114,7 @@ func uploadObject(client *s3.Client, bucket, key, renterdPath string) ([32]byte,
 
 	h := sha256.New()
 	r := bufio.NewReaderSize(io.TeeReader(content.Body, h), 256*(1<<20)) // 256 MiB buffer
-	if err := workerUploadObject(context.Background(), r, renterdPath, contractSet, minShards, totalShards); err != nil {
+	if err := workerClient.UploadObject(context.Background(), r, renterdPath, api.UploadWithContractSet(contractSet), api.UploadWithRedundancy(minShards, totalShards)); err != nil {
 		return [32]byte{}, fmt.Errorf("failed to upload %s: %w", renterdPath, err)
 	}
 	var checksum [32]byte
@@ -112,7 +123,7 @@ func uploadObject(client *s3.Client, bucket, key, renterdPath string) ([32]byte,
 }
 
 func redundantSize(size uint64, minShards, totalShards int) uint64 {
-	return uint64(math.Ceil(float64(size)/float64(uint64(minShards)*rhp.SectorSize))) * uint64(totalShards) * rhp.SectorSize
+	return uint64(math.Ceil(float64(size)/float64(uint64(minShards)*rhp2.SectorSize))) * uint64(totalShards) * rhp2.SectorSize
 }
 
 func main() {
@@ -124,7 +135,8 @@ func main() {
 		panic(err)
 	}
 
-	bus := bus.NewClient(busAddr, busPass)
+	busClient = bus.NewClient(busAddr, busPass)
+	workerClient = worker.NewClient(workerAddr, workerPass)
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion), config.WithCredentialsProvider(aws.AnonymousCredentials{}))
 	if err != nil {
 		log.Fatal("failed to load AWS config", zap.Error(err))
@@ -161,7 +173,7 @@ func main() {
 				var start time.Time
 				for j := 0; j < 10; j++ { // retry failed uploads
 					start = time.Now()
-					checksum, uploadErr = uploadObject(client, *bucket, *obj.Key, renterdPath)
+					checksum, uploadErr = uploadObject(*bucket, *obj.Key, renterdPath)
 					if uploadErr != nil {
 						log.Error("upload attempt failed", zap.Int("attempt", j+1), zap.Error(uploadErr), zap.Duration("elapsed", time.Since(start)))
 						time.Sleep(30 * time.Second)
@@ -197,7 +209,7 @@ func main() {
 		}
 		for _, obj := range page.Contents {
 			renterdPath := filepath.Join(*bucket, *obj.Key)
-			exists, err := objectExists(bus, renterdPath)
+			exists, err := objectExists(renterdPath)
 			if err != nil {
 				log.Fatal("failed to check object existence", zap.Error(err))
 			} else if exists {
