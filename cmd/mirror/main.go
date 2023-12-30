@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,13 +16,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/siacentral/apisdkgo/sia"
 	rhp2 "go.sia.tech/core/rhp/v2"
+	"go.sia.tech/core/types"
 	"go.sia.tech/renterd/api"
 	"go.sia.tech/renterd/bus"
 	"go.sia.tech/renterd/worker"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/time/rate"
+	"lukechampine.com/frand"
 )
 
 var (
@@ -41,10 +42,6 @@ var (
 	verifyUploads bool
 
 	threads int
-
-	workerClient *worker.Client
-	busClient    *bus.Client
-	s3Client     *s3.Client
 )
 
 func formatBpsString(b uint64, t time.Duration) string {
@@ -88,25 +85,8 @@ func init() {
 	flag.Parse()
 }
 
-func objectExists(renterdPath string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	obj, _, err := busClient.Object(ctx, renterdPath, api.ObjectsWithLimit(1), api.ObjectsWithOffset(0))
-	if err == nil {
-		return true, nil
-	} else if strings.Contains(err.Error(), "object not found") {
-		return false, nil
-	} else if strings.Contains(err.Error(), "no slabs found") {
-		return false, nil
-	} else if obj.Health <= 25 {
-		return false, nil
-	}
-	return false, err
-}
-
-func uploadObject(bucket, key, renterdPath string) ([32]byte, error) {
-	content, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+func uploadObject(client *s3.Client, workerClient *worker.Client, bucket, key string) ([32]byte, error) {
+	content, err := client.GetObject(context.Background(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("failed to get object %s/%s: %w", bucket, key, err)
 	}
@@ -114,8 +94,9 @@ func uploadObject(bucket, key, renterdPath string) ([32]byte, error) {
 
 	h := sha256.New()
 	r := bufio.NewReaderSize(io.TeeReader(content.Body, h), 256*(1<<20)) // 256 MiB buffer
-	if err := workerClient.UploadObject(context.Background(), r, renterdPath, api.UploadWithContractSet(contractSet), api.UploadWithRedundancy(minShards, totalShards)); err != nil {
-		return [32]byte{}, fmt.Errorf("failed to upload %s: %w", renterdPath, err)
+	_, err = workerClient.UploadObject(context.Background(), r, bucket, key, api.UploadObjectOptions{})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to upload %s: %w", key, err)
 	}
 	var checksum [32]byte
 	copy(checksum[:], h.Sum(nil))
@@ -124,6 +105,65 @@ func uploadObject(bucket, key, renterdPath string) ([32]byte, error) {
 
 func redundantSize(size uint64, minShards, totalShards int) uint64 {
 	return uint64(math.Ceil(float64(size)/float64(uint64(minShards)*rhp2.SectorSize))) * uint64(totalShards) * rhp2.SectorSize
+}
+
+func updateHostAllowlist(ctx context.Context) (good int, bad int, _ error) {
+	sc := sia.NewClient()
+	b := bus.NewClient(busAddr, busPass)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	// get current host allowlist
+	allowlist, err := b.HostAllowlist(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get host allowlist: %w", err)
+	}
+
+	currentHosts := make(map[types.PublicKey]bool)
+	for _, host := range allowlist {
+		currentHosts[host] = true
+	}
+
+	var goodHosts, badHosts []types.PublicKey
+	// get top 500 fastest hosts
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		default:
+		}
+
+		hosts, err := sc.GetActiveHosts(i, 100,
+			sia.HostFilterBenchmarked(true),
+			sia.HostFilterSort(sia.HostSortDownloadSpeed, true))
+		if err != nil {
+			break
+		}
+
+		for _, host := range hosts {
+			var pub types.PublicKey
+			if err := pub.UnmarshalText([]byte(host.PublicKey)); err != nil {
+				return 0, 0, fmt.Errorf("failed to unmarshal public key: %w", err)
+			}
+			if currentHosts[pub] {
+				delete(currentHosts, pub)
+				continue
+			}
+			goodHosts = append(goodHosts, pub)
+		}
+	}
+
+	for pub := range currentHosts {
+		badHosts = append(badHosts, pub)
+	}
+
+	if len(goodHosts) == 0 && len(badHosts) == 0 {
+		return 0, 0, nil
+	} else if err := b.UpdateHostAllowlist(ctx, goodHosts, badHosts, false); err != nil {
+		return 0, 0, fmt.Errorf("failed to update host allowlist: %w", err)
+	}
+	return len(goodHosts), len(badHosts), nil
 }
 
 func main() {
@@ -135,14 +175,12 @@ func main() {
 		panic(err)
 	}
 
-	busClient = bus.NewClient(busAddr, busPass)
-	workerClient = worker.NewClient(workerAddr, workerPass)
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion), config.WithCredentialsProvider(aws.AnonymousCredentials{}))
 	if err != nil {
 		log.Fatal("failed to load AWS config", zap.Error(err))
 	}
 
-	s3Client = s3.NewFromConfig(cfg)
+	s3Client := s3.NewFromConfig(cfg)
 	bucket := aws.String(bucketName)
 
 	log.Info("starting mirror")
@@ -161,29 +199,45 @@ func main() {
 		})
 	}
 
+	/*go func() {
+		for {
+			added, removed, err := updateHostAllowlist(context.Background())
+			if err != nil {
+				log.Error("failed to update host allowlist", zap.Error(err))
+			}
+			log.Info("updated host allowlist", zap.Int("added", added), zap.Int("removed", removed))
+			time.Sleep(5 * time.Minute)
+		}
+	}()*/
+
+	workerClient := worker.NewClient(workerAddr, workerPass)
+
 	for i := 0; i < threads; i++ {
 		log := log.Named("upload").With(zap.Int("worker", i+1))
 		go func(log *zap.Logger) {
 			for obj := range uploadQueue {
 				var uploadErr error
-				renterdPath := filepath.Join(*bucket, *obj.Key)
 				var checksum [32]byte
-				log := log.With(zap.String("key", *obj.Key), zap.String("renterdPath", renterdPath), zap.Int64("bytes", obj.Size))
+				log := log.With(zap.String("key", *obj.Key), zap.Int64("bytes", obj.Size))
 				log.Info("starting upload")
 				var start time.Time
-				for j := 0; j < 10; j++ { // retry failed uploads
+				for j := 0; ; j++ { // retry failed uploads
 					start = time.Now()
-					checksum, uploadErr = uploadObject(*bucket, *obj.Key, renterdPath)
+					checksum, uploadErr = uploadObject(s3Client, workerClient, *bucket, *obj.Key)
 					if uploadErr != nil {
 						log.Error("upload attempt failed", zap.Int("attempt", j+1), zap.Error(uploadErr), zap.Duration("elapsed", time.Since(start)))
-						time.Sleep(30 * time.Second)
+						sleepTime := time.Duration(math.Pow(2+frand.Float64(), float64(j))) * time.Millisecond
+						if sleepTime > time.Minute {
+							sleepTime = time.Minute
+						}
+						time.Sleep(sleepTime)
 					} else {
 						break
 					}
 				}
 				elapsed := time.Since(start)
 				if uploadErr != nil {
-					log.Fatal("upload failed", zap.Error(uploadErr))
+					log.Error("upload failed", zap.Error(uploadErr))
 				}
 				// calculate the redundant size of the object
 				redundantSize := redundantSize(uint64(obj.Size), minShards, totalShards)
@@ -208,19 +262,6 @@ func main() {
 			log.Fatal("failed to list objects", zap.Error(err))
 		}
 		for _, obj := range page.Contents {
-			renterdPath := filepath.Join(*bucket, *obj.Key)
-			exists, err := objectExists(renterdPath)
-			if err != nil {
-				log.Fatal("failed to check object existence", zap.Error(err))
-			} else if exists {
-				// calculate the redundant size of the object
-				redundantSize := redundantSize(uint64(obj.Size), minShards, totalShards)
-				// increment the global counters
-				bytes := atomic.AddUint64(&totalBytes, redundantSize)
-				n := atomic.AddUint64(&uploadedObjects, 1)
-				log.Info("skipping existing object", zap.String("renterdPath", renterdPath), zap.Uint64("objects", n), zap.Uint64("totalBytes", bytes))
-				continue
-			}
 			uploadQueue <- obj
 		}
 	}
